@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover"
+    />
+    <title>元素不定高+缓冲元素+支持千万级数据量+性能优化</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+      }
+      #container {
+        height: 400px;
+        max-width: 400px;
+        background-color: #f6f6f6;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>元素不定高+缓冲元素+支持千万级数据量+性能优化</h3>
+    <p>
+      相较于前一个实现，优化了每次更新元素位置信息时的计算量，使用鼠标滚轮从上往下滑的过程中比较顺畅，但如果拖动滚动条，一次跳转太多，计算量依然较大，取决于电脑性能，也可能会存在一定的卡顿
+    </p>
+    <div id="container"></div>
+
+    <p><input type="number" id="num1" min="0" step="1000" /> <button id="btn1">更新列表长度</button></p>
+    <p><input type="number" id="num3" min="0" step="100" /> <button id="btn3">指定开始位置的元素索引</button></p>
+    <p><input type="number" id="num4" min="0" step="100" /> <button id="btn4">修改 container 的高度</button></p>
+
+    <script type="module">
+      import { faker } from "./faker/locale/zh_CN.mjs";
+      class VirtualScroll {
+        constructor({ $container, list, itemHeight, bufferSize = 0, itemDOMGenerator, postRender }) {
+          this.$container = $container;
+          this._list = list;
+          this._itemHeight = itemHeight;
+          this._itemDOMCache = [];
+          this._itemPosInfo = list.map((_, i) => {
+            const top = this.itemHeight * i;
+            return { top, height: this.itemHeight, bottom: top + this.itemHeight };
+          });
+          this._heightUpdates = {};
+          this._lastUpdatedIndex = -1;
+          this._lastUpdatedItemPosInfo = { top: 0, height: 0, bottom: 0 };
+          this._startIndex = 0;
+          this._bufferSize = bufferSize;
+
+          this._itemDOMGenerator = itemDOMGenerator?.bind(this);
+          this._postRender = postRender?.bind(this);
+          this._limitIndex = this._limitIndex.bind(this);
+          this._onItemsHeightUpdate = this._onItemsHeightUpdate.bind(this);
+          this._doItemsHeightUpdate = this._doItemsHeightUpdate.bind(this);
+          this._searchStartIndex = this._searchStartIndex.bind(this);
+
+          // wrapper 的作用在于撑出滚动条
+          this._$wrapper = document.createElement("div");
+          this._$wrapper.style.height = `${this._realTotalHeight}px`;
+          this.$container.style.overflow = "auto";
+          this.$container.appendChild(this._$wrapper);
+          // 监听 container 的 scroll 事件，及时更新渲染内容
+          this._onContainerScroll = this._onContainerScroll.bind(this);
+          this.$container.addEventListener("scroll", this._onContainerScroll);
+          this.render = this.render.bind(this);
+          // 通过修改 this.containerHeight 除了可以改变容器高度，也会触发重新渲染，对于支持 ResizeObserver 的浏览器，监听到容器高度变化时，还会自动重新渲染
+          if (ResizeObserver) {
+            const observer = new ResizeObserver((mutations) => {
+              mutations.forEach((mutation) => {
+                if (mutation.target === this.$container) {
+                  this._containerHeight = mutation.contentRect.height;
+                  this.render(true);
+                }
+              });
+            });
+            // 监听之后，即使容器高度没发生变化，也会有一个初始触发
+            observer.observe(this.$container, { box: "content-box" });
+          } else {
+            this._containerHeight = parseFloat(getComputedStyle(this.$container).height);
+            this.render(true);
+          }
+        }
+
+        get list() {
+          return this._list;
+        }
+        // 支持动态修改列表数据
+        set list(value) {
+          const oldZoomRate = this._zoomRate;
+          this._list = value;
+          this._itemDOMCache = [];
+          this._itemPosInfo = value.map((_, i) => {
+            const top = this.itemHeight * i;
+            return { top, height: this.itemHeight, bottom: top + this.itemHeight };
+          });
+          this._heightUpdates = {};
+          this._lastUpdatedIndex = -1;
+          this._lastUpdatedItemPosInfo = { top: 0, height: 0, bottom: 0 };
+          this._$wrapper.style.height = `${this._realTotalHeight}px`;
+          this.scrollTop = (this.scrollTop * oldZoomRate) / this._zoomRate;
+          return value;
+        }
+        get itemHeight() {
+          return this._itemHeight;
+        }
+        get scrollTop() {
+          return this.$container.scrollTop;
+        }
+        // 支持滚动到指定位置
+        set scrollTop(value) {
+          this.$container.removeEventListener("scroll", this._onContainerScroll);
+          const maxScrollTop = this._totalHeight - this.containerHeight;
+          this.$container.scrollTop = Math.min(Math.max(0, value), maxScrollTop);
+          this.render(true);
+          requestAnimationFrame(() => this.$container.addEventListener("scroll", this._onContainerScroll));
+          return value;
+        }
+        get startIndex() {
+          return this._startIndex;
+        }
+        // 支持将某个元素滚动到开始位置
+        set startIndex(value) {
+          this.scrollTop = this._itemPosInfo[this._limitIndex(value)].top / this._zoomRate;
+          return value;
+        }
+        get _totalHeight() {
+          const updatedHeight = this._lastUpdatedItemPosInfo.bottom;
+          const unUpdatedHeight = (this.list.length - (this._lastUpdatedIndex + 1)) * this.itemHeight;
+          return updatedHeight + unUpdatedHeight;
+        }
+        // 谷歌浏览器中元素能设置的最大高度大概是 16777200 (https://bugs.chromium.org/p/chromium/issues/detail?id=401762)
+        // 当子元素的总高度超过 16777200 时，wrapper 的实际高度会小于理论高度，导致无法滚动到底部
+        // scrollTop 的理论最大值是 0 到 (子元素的总高度 - container的高度)
+        // scrollTop 的实际最大值是 0 到 (16777200 - container的高度)
+        // 所以当子元素的总高度超过 16777200 时，我们需要把 scrollTop 的值等比放大，获得一个模拟的 scrollTop 值
+        get _realTotalHeight() {
+          return Math.min(16777200, this._totalHeight);
+        }
+        get _zoomRate() {
+          return (this._totalHeight - this.containerHeight) / (this._realTotalHeight - this.containerHeight);
+        }
+        get containerHeight() {
+          return this._containerHeight;
+        }
+        set containerHeight(value) {
+          this._containerHeight = value;
+          this.$container.style.height = `${value}px`;
+          this.render(true);
+        }
+
+        // 限制索引不能小于0或者大于列表长度-1
+        _limitIndex(index) {
+          return Math.min(Math.max(index, 0), this.list.length - 1);
+        }
+        _onContainerScroll(e) {
+          if (e.target === this.$container) {
+            e.stopPropagation();
+            this.render();
+          }
+        }
+        _onItemsHeightUpdate(updates) {
+          // 记住高度的变化信息，用于之后更新 this._itemPosInfo
+          this._heightUpdates = { ...this._heightUpdates, ...updates };
+          // this._lastUpdatedIndex 及之前的位置信息是可靠的，如果 updates 发生在它之前，那么这个可靠的位置就得前移了
+          this._lastUpdatedIndex = Math.min(this._lastUpdatedIndex, Math.min(...Object.keys(updates)) - 1);
+          this._lastUpdatedItemPosInfo = this._itemPosInfo[this._lastUpdatedIndex] || { top: 0, height: 0, bottom: 0 };
+          // 当元素的高度发生变化时，要保证这些高度值更新进入 this._itemPosInfo
+          const updateToIndex = Math.max(...Object.keys(updates));
+          // 从最后一个可靠位置更新到最后一个发生变化的位置
+          this._doItemsHeightUpdate(this.scrollTop * this._zoomRate, updateToIndex);
+        }
+        _doItemsHeightUpdate(scrollTop, updateToIndex) {
+          while (
+            // 必须一直更新到一个可靠的位置，这个位置的 top 值能达到 scrollTop 的位置，以保证之后搜索 startIndex 时，能在可靠信息中搜到
+            scrollTop > this._lastUpdatedItemPosInfo.top ||
+            (updateToIndex && this._lastUpdatedIndex < updateToIndex)
+          ) {
+            const _nextIndex = this._lastUpdatedIndex + 1;
+            const _nextItemPosInfo = this._itemPosInfo[_nextIndex];
+            if (!_nextItemPosInfo) {
+              break;
+            }
+            // 下一个元素的开始位置就是前一个元素的底部位置
+            _nextItemPosInfo.top = this._lastUpdatedItemPosInfo.bottom;
+            // 判断下一个元素是否有新高度以及这个新高度值是否合法(有时候由于滚动过快，元素已经隐藏了，会出现获取到的 newHeight 为 0 的情况，this.itemHeight 是预估的元素高度最小值)
+            const newHeight = this._heightUpdates[_nextIndex];
+            if (newHeight && newHeight > this.itemHeight) {
+              _nextItemPosInfo.height = newHeight;
+              _nextItemPosInfo.bottom = _nextItemPosInfo.top + newHeight;
+            } else {
+              _nextItemPosInfo.bottom = _nextItemPosInfo.top + _nextItemPosInfo.height;
+            }
+            this._lastUpdatedIndex = _nextIndex;
+            this._lastUpdatedItemPosInfo = _nextItemPosInfo;
+          }
+          // 修改 wrapper 的高度，以保证滚动条适配当前的内容
+          this._$wrapper.style.height = `${this._realTotalHeight}px`;
+        }
+        // 搜索当前 scrollTop 对于的起始元素索引
+        _searchStartIndex(scrollTop) {
+          // 在搜索 startIndex 前，先更新 this._itemPosInfo，但只更新到 scrollTop 所在的位置就停止，避免大量的计算导致的卡顿
+          this._doItemsHeightUpdate(scrollTop);
+          const length = this._itemPosInfo.length;
+          if (!length || scrollTop <= this._itemPosInfo[0].top) {
+            return 0;
+          }
+          let lowIndex = 0;
+          let highIndex = this._lastUpdatedIndex === -1 ? length - 1 : this._lastUpdatedIndex; // 经过 _doItemsHeightUpdate 的操作后，当前滚动位置对应的开始元素的索引一定不会超过 lastUpdatedIndex
+          if (scrollTop > this._itemPosInfo[highIndex].top) {
+            return highIndex;
+          }
+          while (highIndex - lowIndex > 1) {
+            const midIndex = Math.floor((highIndex + lowIndex) / 2);
+            const midValue = this._itemPosInfo[midIndex].top;
+            if (scrollTop > midValue) {
+              lowIndex = midIndex;
+            } else if (midValue === scrollTop) {
+              lowIndex = highIndex = midIndex;
+            } else {
+              highIndex = midIndex;
+            }
+          }
+          return lowIndex;
+        }
+        render(forceRender) {
+          const zoomScrollTop = this.scrollTop * this._zoomRate; // 等效滚动距离
+          const _startIndex = this._searchStartIndex(zoomScrollTop);
+          // 等效滚动距离要比实际滚动距离长，视觉上需要补偿这部分滚动(虽然这个方案可以实现更大数据量的虚拟滚动，但是由于这种补偿机制，会让列表看起滚的有点快，在移动端滑动时也会不跟手)
+          const moreScroll = zoomScrollTop - this.scrollTop;
+          if (forceRender || Math.abs(this.startIndex - _startIndex) > this._bufferSize) {
+            this._startIndex = _startIndex;
+            const fromIndex = this._limitIndex(this.startIndex - this._bufferSize);
+            const showCount = Math.ceil(this.containerHeight / this.itemHeight);
+            const toIndex = this._limitIndex(this.startIndex + showCount + this._bufferSize);
+            // 由于我们只渲染了部分元素，那些本该由上面“消失”的元素撑起的部分“塌陷了”，所以我们渲染的这些元素也需要偏移一定的量，以模拟被“撑起”的效果
+            this._offset = this._itemPosInfo[fromIndex].top;
+            const $list = document.createDocumentFragment();
+            for (let i = fromIndex; i <= toIndex; i++) {
+              let $item = this._itemDOMCache[i];
+              if (!$item) {
+                this._itemDOMCache[i] = $item = this._itemDOMGenerator(this.list[i], i);
+              }
+              $item.style.minHeight = `${this.itemHeight}px`;
+              $item.style.boxSizing = "border-box";
+              $item.style.transform = `translateY(${this._offset - moreScroll}px)`;
+              $list.appendChild($item);
+            }
+            this._$wrapper.innerHTML = "";
+            this._$wrapper.appendChild($list);
+            this._postRender?.();
+            // 元素创建后，获取高度，更新缓存的元素位置信息
+            requestAnimationFrame(() => {
+              const updates = {};
+              for (let i = fromIndex; i <= toIndex; i++) {
+                updates[i] = this._itemDOMCache[i].getBoundingClientRect().height;
+              }
+              this._onItemsHeightUpdate(updates);
+            });
+          } else {
+            this._$wrapper.childNodes.forEach(($item) => {
+              $item.style.transform = `translateY(${this._offset - moreScroll}px)`;
+            });
+          }
+        }
+      }
+
+      const num1 = document.getElementById("num1");
+      const num3 = document.getElementById("num3");
+      const num4 = document.getElementById("num4");
+
+      const btn1 = document.getElementById("btn1");
+      const btn3 = document.getElementById("btn3");
+      const btn4 = document.getElementById("btn4");
+
+      const vs = new VirtualScroll({
+        $container: document.getElementById("container"),
+        list: [...new Array(10000000).keys()],
+        itemHeight: 40, // 预估的元素最小高度，这个值会参与计算一次显示的元素数量，所以这个值不能比实际的元素高度大，不然可能会导致渲染的元素不足以填满容器
+        bufferSize: 50,
+        itemDOMGenerator(item, index) {
+          const $item = document.createElement("div");
+          $item.style.borderBottom = "1px solid #ccc";
+          $item.innerText = `第${index}个: ${faker.lorem.paragraph()}`;
+          return $item;
+        },
+        postRender() {
+          console.log("render");
+          num3.value = this.startIndex;
+        },
+      });
+
+      num1.value = vs.list.length;
+      num4.value = parseFloat(getComputedStyle(vs.$container).height);
+
+      btn1.onclick = () => {
+        vs.list = [...new Array(Number(num1.value)).keys()];
+      };
+
+      btn3.onclick = () => {
+        vs.startIndex = Number(num3.value);
+      };
+
+      btn4.onclick = () => {
+        vs.containerHeight = Number(num4.value);
+      };
+    </script>
+  </body>
+</html>

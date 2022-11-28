@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover"
+    />
+    <title>原生滚动</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+      }
+      #container {
+        height: 400px;
+        max-width: 400px;
+        background-color: #f6f6f6;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>原生滚动</h3>
+    <p>首次加载时有明显卡顿感，使用 Performance 调试面板可以看到 Rendering 阶段占据了大量时间</p>
+    <div id="container"></div>
+    <script>
+      const container = document.querySelector("#container");
+      const fragment = document.createDocumentFragment();
+      for (let i = 0; i < 100000; i++) {
+        const div = document.createElement("div");
+        div.innerText = `第${i}个`;
+        fragment.appendChild(div);
+      }
+      container.appendChild(fragment);
+    </script>
+  </body>
+</html>

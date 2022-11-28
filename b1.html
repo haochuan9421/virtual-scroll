@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,maximum-scale=1,minimum-scale=1,user-scalable=no,viewport-fit=cover"
+    />
+    <title>元素定高+缓冲元素+支持任意级别数据量</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+      }
+      #container {
+        height: 400px;
+        max-width: 400px;
+        background-color: #f6f6f6;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>元素定高+缓冲元素+支持任意级别数据量</h3>
+    <p>
+      使用模拟滚动条后，由于 scrollTop
+      的值是虚拟的，所以也就不受浏览器对于元素最大高度的限制，理论上可以实现任意数量级的虚拟滚动，而且更加跟手
+    </p>
+    <div id="container"></div>
+
+    <p><input type="number" id="num1" min="0" step="1000" /> <button id="btn1">更新列表长度</button></p>
+    <p><input type="number" id="num2" min="0" step="10" /> <button id="btn2">更新元素高度</button></p>
+    <p><input type="number" id="num3" min="0" step="100" /> <button id="btn3">指定开始位置的元素索引</button></p>
+    <p><input type="number" id="num4" min="0" step="100" /> <button id="btn4">修改 container 的高度</button></p>
+
+    <script>
+      class VirtualScroll {
+        constructor({ $container, list, itemHeight, bufferSize = 0, itemDOMGenerator, postRender }) {
+          this.$container = $container;
+          this._list = list;
+          this._itemHeight = itemHeight;
+          this._itemDOMCache = [];
+          this._startIndex = 0;
+          this._scrollTop = 0;
+          this._bufferSize = bufferSize;
+
+          this._itemDOMGenerator = itemDOMGenerator?.bind(this);
+          this._postRender = postRender?.bind(this);
+          this._limitIndex = this._limitIndex.bind(this);
+          this._limitScrollTop = this._limitScrollTop.bind(this);
+          this._limitScrollBarTop = this._limitScrollBarTop.bind(this);
+
+          // wrapper 的作用仅用于包裹渲染的元素，便于进行位移和重新创建DOM
+          this._$wrapper = document.createElement("div");
+          this.$container.style.overflow = "hidden";
+          this.$container.style.position = "relative";
+          this.$container.appendChild(this._$wrapper);
+          // 处理发生的滚动，及时更新渲染内容
+          this._onContainerScroll = this._onContainerScroll.bind(this);
+          if ("ontouchstart" in document.documentElement) {
+            // 移动端设备
+            let startY, startTime, speed;
+            const move = () => {
+              if (Math.abs(speed) > 0) {
+                requestAnimationFrame(() => {
+                  this._onContainerScroll(this._scrollTop + speed * 5);
+                  if (speed > 0) {
+                    speed = Math.max(0, speed - 0.03);
+                  } else {
+                    speed = Math.min((0, speed + 0.03));
+                  }
+                  move();
+                });
+              }
+            };
+            this.$container.addEventListener("touchstart", (e) => {
+              startY = e.changedTouches[0].clientY;
+              startTime = Date.now();
+            });
+            this.$container.addEventListener("touchmove", (e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              const endY = e.changedTouches[0].clientY;
+              const diffY = startY - endY;
+              startY = endY;
+              const now = Date.now();
+              const diffTime = now - startTime;
+              startTime = now;
+              speed = diffY / diffTime;
+              this._onContainerScroll(this._scrollTop + diffY);
+            });
+            // 如果滑动的速度比较快，则滑动结束后保持一段时间的匀减速运动
+            this.$container.addEventListener("touchend", () => {
+              Math.abs(speed) > 1 && move();
+            });
+          } else {
+            // PC端设备
+            this._$scollbar = document.createElement("div");
+            this._$scollbox = document.createElement("div");
+            this._$scollbar.style.cssText +=
+              "position:absolute;top:0;bottom:0;right:0;width:20px;background-color:#ccc;z-index:1000";
+            this._$scollbox.style.cssText +=
+              "position:absolute;top:0;left:0;right:0;height:20px;background-color:red;cursor:pointer;";
+            this._$scollbar.appendChild(this._$scollbox);
+            this.$container.appendChild(this._$scollbar);
+            // 处理鼠标滚动的事件
+            this.$container.addEventListener("mousewheel", (e) => {
+              e.stopPropagation();
+              e.preventDefault();
+              this._onContainerScroll(this._scrollTop + e.deltaY);
+            });
+            // 处理拖动滚动条的事件
+            this._$scollbox.addEventListener("mousedown", (e) => {
+              const userSelect = document.documentElement.style.userSelect;
+              document.documentElement.style.userSelect = "none";
+              let startY = e.clientY;
+              const moveHandler = (e) => {
+                const endY = e.clientY;
+                const diffY = endY - startY;
+                startY = endY;
+                const scrollBarTop = this._limitScrollBarTop(this.scrollBarTop + diffY);
+                this._onContainerScroll(this._maxScrollTop * (scrollBarTop / this._maxScrollBarTop));
+              };
+              const upHandle = (e) => {
+                window.removeEventListener("mousemove", moveHandler);
+                window.removeEventListener("mouseup", upHandle);
+                document.documentElement.style.userSelect = userSelect;
+              };
+              window.addEventListener("mousemove", moveHandler);
+              window.addEventListener("mouseup", upHandle);
+            });
+          }
+          this.render = this.render.bind(this);
+          // 通过修改 this.containerHeight 除了可以改变容器高度，也会触发重新渲染，对于支持 ResizeObserver 的浏览器，监听到容器高度变化时，还会自动重新渲染
+          if (ResizeObserver) {
+            const observer = new ResizeObserver((mutations) => {
+              mutations.forEach((mutation) => {
+                if (mutation.target === this.$container) {
+                  this._containerHeight = mutation.contentRect.height;
+                  this.render(true);
+                }
+              });
+            });
+            // 监听之后，即使容器高度没发生变化，也会有一个初始触发
+            observer.observe(this.$container, { box: "content-box" });
+          } else {
+            this._containerHeight = parseFloat(getComputedStyle(this.$container).height);
+            this.render(true);
+          }
+        }
+
+        get list() {
+          return this._list;
+        }
+        // 支持动态修改列表数据
+        set list(value) {
+          this._list = value;
+          this._itemDOMCache = [];
+          this.scrollTop = this.scrollTop;
+          return value;
+        }
+        get itemHeight() {
+          return this._itemHeight;
+        }
+        // 支持动态修改元素高度
+        set itemHeight(value) {
+          const oldTotalHeight = this._totalHeight;
+          this._itemHeight = value;
+          // 计算新的可滚动距离和原可滚动距离的比率，等比缩放 scrollTop 的值，以保持当前显示的元素不偏离
+          const spaceRate = (this._totalHeight - this.containerHeight) / (oldTotalHeight - this.containerHeight);
+          this.scrollTop = this.scrollTop * spaceRate;
+          return value;
+        }
+        get scrollTop() {
+          return this._scrollTop;
+        }
+        // 支持滚动到指定位置
+        set scrollTop(value) {
+          this._scrollTop = this._limitScrollTop(value);
+          this.render(true);
+          return value;
+        }
+        get startIndex() {
+          return this._startIndex;
+        }
+        // 支持将某个元素滚动到开始位置
+        set startIndex(value) {
+          this.scrollTop = value * this.itemHeight;
+          return value;
+        }
+        get _totalHeight() {
+          return this.list.length * this.itemHeight;
+        }
+        get containerHeight() {
+          return this._containerHeight;
+        }
+        set containerHeight(value) {
+          this._containerHeight = value;
+          this.$container.style.height = `${value}px`;
+          this.render(true);
+        }
+        get _maxScrollTop() {
+          return Math.max(0, this._totalHeight - this.containerHeight);
+        }
+        // 限制 scrollTop 的范围
+        _limitScrollTop(value) {
+          return Math.min(Math.max(0, value), this._maxScrollTop);
+        }
+        get scrollBarTop() {
+          return this._maxScrollTop && this._maxScrollBarTop * (this.scrollTop / this._maxScrollTop);
+        }
+        get _maxScrollBarTop() {
+          return this.containerHeight - 20;
+        }
+        // 限制 scrollBarTop 的范围
+        _limitScrollBarTop(value) {
+          return Math.max(0, Math.min(value, this._maxScrollBarTop));
+        }
+        // 限制索引不能小于0或者大于列表长度-1
+        _limitIndex(index) {
+          return Math.min(Math.max(index, 0), this.list.length - 1);
+        }
+        _onContainerScroll(value) {
+          this._scrollTop = this._limitScrollTop(value);
+          this.render();
+        }
+        render(forceRender) {
+          const _startIndex = this._limitIndex(Math.floor(this.scrollTop / this.itemHeight));
+          if (forceRender || Math.abs(this.startIndex - _startIndex) > this._bufferSize) {
+            this._startIndex = _startIndex;
+            const fromIndex = this._limitIndex(this.startIndex - this._bufferSize);
+            const showCount = Math.ceil(this.containerHeight / this.itemHeight);
+            const toIndex = this._limitIndex(this.startIndex + showCount + this._bufferSize);
+            // 由于我们只渲染了部分元素，那些本该由上面“消失”的元素撑起的部分“塌陷了”，所以我们渲染的这些元素也需要偏移一定的量，以模拟被“撑起”的效果
+            this._offset = fromIndex * this.itemHeight;
+            const $list = document.createDocumentFragment();
+            for (let i = fromIndex; i <= toIndex; i++) {
+              let $item = this._itemDOMCache[i];
+              if (!$item) {
+                this._itemDOMCache[i] = $item = this._itemDOMGenerator(this.list[i], i);
+              }
+              $item.style.height = `${this.itemHeight}px`;
+              $item.style.boxSizing = "border-box";
+              $list.appendChild($item);
+            }
+            this._$wrapper.innerHTML = "";
+            this._$wrapper.appendChild($list);
+            this._postRender?.();
+          }
+          this._$wrapper.style.transform = `translateY(${-this.scrollTop + this._offset}px)`;
+          if (this._$scollbox) {
+            if (this._maxScrollTop > 0) {
+              this._$scollbox.style.top = `${this.scrollBarTop}px`;
+              this._$scollbar.style.display = `block`;
+            } else {
+              this._$scollbar.style.display = `none`;
+            }
+          }
+        }
+      }
+
+      const num1 = document.getElementById("num1");
+      const num2 = document.getElementById("num2");
+      const num3 = document.getElementById("num3");
+      const num4 = document.getElementById("num4");
+
+      const btn1 = document.getElementById("btn1");
+      const btn2 = document.getElementById("btn2");
+      const btn3 = document.getElementById("btn3");
+      const btn4 = document.getElementById("btn4");
+
+      const vs = new VirtualScroll({
+        $container: document.getElementById("container"),
+        list: [...new Array(10000000).keys()],
+        itemHeight: 40,
+        bufferSize: 50,
+        itemDOMGenerator(item, index) {
+          const $item = document.createElement("div");
+          $item.style.borderBottom = "1px solid #ccc";
+          $item.innerText = `第${index}个`;
+          return $item;
+        },
+        postRender() {
+          console.log("render");
+          num3.value = this.startIndex;
+        },
+      });
+
+      num1.value = vs.list.length;
+      num2.value = vs.itemHeight;
+      num4.value = parseFloat(getComputedStyle(vs.$container).height);
+
+      btn1.onclick = () => {
+        vs.list = [...new Array(Number(num1.value)).keys()];
+      };
+
+      btn2.onclick = () => {
+        vs.itemHeight = Number(num2.value);
+      };
+
+      btn3.onclick = () => {
+        vs.startIndex = Number(num3.value);
+      };
+
+      btn4.onclick = () => {
+        vs.containerHeight = Number(num4.value);
+      };
+    </script>
+  </body>
+</html>
